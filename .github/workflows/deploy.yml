@@ -1,0 +1,133 @@
+name: Build, Push to Private Registry and Deploy with Helm
+on:
+  push:
+    branches: [ main ] # Используем main, как в вашем примере
+
+env:
+  REGISTRY: "ghcr.io" # <-- ВАЖНО: Замените на ваш реальный IP и порт Insecure Registry
+  IMAGE_NAME: "myatnyjchaj3/devops3"
+  HELM_RELEASE: "django-app"
+  K8S_NAMESPACE: "django-app" # <-- Или другое ваше рабочее пространство
+
+jobs:
+  # Удаляем 'test' для краткости, но в реальном проекте он должен быть!
+  # test:
+  #   ...
+
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+        
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          # Используем имя образа с префиксом REGISTRY
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          # Используем кеширование для ускорения сборки
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache,mode=max
+
+  deploy-with-helm:
+    needs: build-and-push
+    runs-on: self-hosted # <-- Используем ваш раннер для доступа к Kubeconfig и кластеру
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Helm
+        uses: azure/setup-helm@v3
+        with:
+          version: "3.12.0" # Указываем конкретную версию
+          
+      - name: Set up Kubeconfig
+        uses: azure/k8s-set-context@v3
+        with:
+          # ВАЖНО: kubeconfig должен быть сохранен в GitHub Secrets
+          kubeconfig: ${{ secrets.KUBE_CONFIG }}
+          
+      - name: Add Helm repositories and update
+        run: |
+          # Добавляем стандартные репозитории, если нужно для вашего чарта
+          helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+          helm repo add bitnami https://charts.bitnami.com/bitnami
+          helm repo update
+          
+      - name: Deploy with Helm
+        run: |
+          # Используем helm upgrade --install для развертывания/обновления
+          # Передаем новый образ и тег в чарт через --set
+          helm upgrade --install ${{ env.HELM_RELEASE }} ./django-app-chart \
+            --namespace ${{ env.K8S_NAMESPACE }} \
+            --set image.repository=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }} \
+            --set image.tag=${{ github.sha }} \
+            --set "imagePullSecrets[0].name=regcred" \
+            --set app.replicas=3 \
+            --set postgresql.auth.postgresPassword=SuperSecret123! \
+            --set global.postgresql.auth.postgresPassword=SuperSecret123! \
+            --create-namespace \
+            --wait \
+            --timeout 300s
+            
+  run-database-migrations:
+    needs: deploy-with-helm
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Kubeconfig
+        uses: azure/k8s-set-context@v3
+        with:
+          kubeconfig: ${{ secrets.KUBE_CONFIG }}
+
+      - name: Run database migrations and collect static
+        run: |
+          # Получаем имя одного из подов (используем метки, заданные в вашем Helm-чарте)
+          POD_NAME=$(kubectl get pods -n ${{ env.K8S_NAMESPACE }} -l "app.kubernetes.io/name=django-app" -o jsonpath='{.items[0].metadata.name}')
+          
+          echo "Running migrations on $POD_NAME"
+          # Выполняем миграции
+          kubectl exec -n ${{ env.K8S_NAMESPACE }} $POD_NAME -- python manage.py migrate
+          
+          echo "Collecting static files on $POD_NAME"
+          # Собираем статику
+          kubectl exec -n ${{ env.K8S_NAMESPACE }} $POD_NAME -- python manage.py collectstatic --noinput
+
+  smoke-test:
+    needs: run-database-migrations # Запускаем после успешных миграций
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Kubeconfig
+        uses: azure/k8s-set-context@v3
+        with:
+          kubeconfig: ${{ secrets.KUBE_CONFIG }}
+
+      - name: Check application health
+        run: |
+          # Получаем URL приложения из Ingress (зависит от вашего Helm-чарта)
+          APP_URL=$(kubectl get ingress -n ${{ env.K8S_NAMESPACE }} -o jsonpath='{.items[0].spec.rules[0].host}')
+          
+          # Проверяем health endpoint
+          echo "Checking health at http://$APP_URL/health/"
+          curl -f http://$APP_URL/health/
+          
+          # Проверяем метрики (если есть)
+          echo "Checking metrics at http://$APP_URL/metrics/"
+          curl -f http://$APP_URL/metrics/
